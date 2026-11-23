@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""factory/bin/gate — verifica deterministica del branch di un job.
+
+  python3 factory/bin/gate JOB            # prima delle review
+  python3 factory/bin/gate JOB --final    # prima della consegna (allinea alla base, poi ricontrolla)
+  python3 factory/bin/gate JOB --check-only   # per il builder: stessi check, nessuna registrazione
+
+Controlli, in ordine:
+  1. il worktree del job esiste ed è pulito (niente modifiche non committate)
+  2. il branch ha almeno un commit rispetto alla base
+  3. (--final) se la base è avanzata, rebase del branch; conflitto = FAIL
+  4. nessun file protetto modificato (protected_paths in config.json)
+  5. factory/checks.sh del repository principale, eseguito nel worktree, con timeout
+
+Esiti: PASS, FAIL (torna al builder con il log), ERROR (configurazione: checks.sh
+non riconosce lo stack o manca il worktree; va all'umano).
+Lo step deve essere stato avviato da `job dispatch`. Il gate scrive report e log,
+poi registra l'esito con `job finish` (unico writer di job.json).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as fl  # noqa: E402
+
+EXIT_CONFIG = 78  # checks.sh: stack non riconosciuto o configurazione mancante
+
+
+class GateLog:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(path, "w", encoding="utf-8")
+        self.rows: list[tuple[str, str, str]] = []
+
+    def line(self, text: str) -> None:
+        self.fh.write(text + "\n")
+        self.fh.flush()
+
+    def row(self, name: str, result: str, detail: str) -> None:
+        self.rows.append((name, result, detail))
+        self.line(f"[gate] {name}: {result} — {detail}")
+
+    def close(self) -> None:
+        self.fh.close()
+
+
+def run_checks(cfg: dict, job: dict, wt: Path, log: GateLog) -> tuple[int | None, float]:
+    script = fl.FACTORY_DIR / "checks.sh"
+    if not script.exists():
+        return EXIT_CONFIG, 0.0
+    timeout = int(cfg["gate"].get("timeout_minutes", 30)) * 60
+    env = dict(os.environ)
+    env.update({
+        "CI": "1",
+        "FACTORY_JOB": job["id"],
+        "FACTORY_REPO": str(fl.REPO_DIR),
+        "FACTORY_WORKTREE": str(wt),
+        "FACTORY_CHECK_DIRS": " ".join(cfg["gate"].get("check_dirs") or []),
+    })
+    log.line(f"[gate] eseguo {script} in {wt} (timeout {timeout // 60} min)")
+    before = untracked(wt)
+    start = time.monotonic()
+    kwargs = {"start_new_session": True} if os.name != "nt" else {}
+    proc = subprocess.Popen(["bash", str(script)], cwd=str(wt), env=env, stdout=log.fh,
+                            stderr=subprocess.STDOUT, **kwargs)
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # pragma: no cover
+            proc.kill()
+        proc.wait()
+        code = None
+    elapsed = time.monotonic() - start
+    remove_generated(wt, before, log)
+    return code, elapsed
+
+
+def untracked(wt: Path) -> set[str]:
+    out = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=str(wt),
+                         capture_output=True, text=True).stdout
+    return {p for p in out.split("\0") if p}
+
+
+def remove_generated(wt: Path, before: set[str], log: GateLog) -> None:
+    """Rimuove i file non tracciati (e non ignorati) creati dai check, come in una CI pulita."""
+    created = sorted(untracked(wt) - before)
+    for rel in created:
+        with contextlib.suppress(OSError):
+            (wt / rel).unlink()
+        parent = (wt / rel).parent
+        while parent != wt and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    if created:
+        log.line(f"[gate] rimossi {len(created)} file generati dai check e non ignorati da git "
+                 f"(es. {', '.join(created[:3])}). Valuta di aggiungerli a .gitignore.")
+
+
+def tail(path: Path, n: int) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
+
+
+def check_summary(path: Path) -> list[str]:
+    out = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("FACTORY-CHECK "):
+                out.append(line[len("FACTORY-CHECK "):])
+    except OSError:
+        pass
+    return out
+
+
+def check_only(cfg: dict, job: dict) -> int:
+    wt = Path(job["worktree"])
+    if not (wt / ".git").exists():
+        print(f"ERRORE: worktree {wt} non trovato", file=sys.stderr)
+        return 4
+    log_path = fl.job_dir(job["id"]) / "logs" / "check-only-latest.log"
+    log = GateLog(log_path)
+    base = job["base"]
+    changed = fl.git("diff", "--name-only", base, cwd=wt, check=False).splitlines()
+    changed += sorted(untracked(wt))
+    protected = [str(x) for x in cfg.get("protected_paths", [])]
+    touched = [f for f in changed if any(f == pp.rstrip("/") or f.startswith(pp) for pp in protected)]
+    log.row("file protetti", "FAIL" if touched else "PASS", ", ".join(touched) or "nessuno")
+    code, duration = run_checks(cfg, job, wt, log)
+    log.close()
+    for line in check_summary(log_path):
+        print(line)
+    status = "PASS" if code == 0 and not touched else ("ERROR" if code == EXIT_CONFIG else "FAIL")
+    print(f"\nCHECK-ONLY {status} in {fl.fmt_duration(duration)} · log completo: {log_path}")
+    if code not in (0, None, EXIT_CONFIG):
+        print("\nUltime righe del log:\n" + tail(log_path, 40))
+    return 0 if status == "PASS" else (78 if status == "ERROR" else 1)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="gate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("job")
+    p.add_argument("--final", action="store_true")
+    p.add_argument("--check-only", action="store_true",
+                   help="esegue file protetti e checks.sh nel worktree senza registrare nulla (uso del builder)")
+    args = p.parse_args()
+    role = "final-gate" if args.final else "gate"
+    try:
+        cfg = fl.load_config()
+        job = fl.load_job(fl.resolve_job_id(args.job))
+    except fl.FactoryError as exc:
+        print(f"ERRORE: {exc}", file=sys.stderr)
+        return 4
+    if args.check_only:
+        return check_only(cfg, job)
+    n = job.get("active", {}).get(role)
+    if not n:
+        print(f"RIFIUTATO: nessuno step {role} attivo per {job['id']} (stadio {job['stage']}). "
+              f"Il gate si avvia solo da `job dispatch`.", file=sys.stderr)
+        return 3
+    step = job["steps"][n - 1]
+    d = fl.job_dir(job["id"])
+    report_path = d / step["report"]
+    log_path = d / step.get("log", f"logs/{n:02d}-{role}.log")
+    log = GateLog(log_path)
+    wt = Path(job["worktree"])
+    base = job["base"]
+    verdict, reason = "PASS", ""
+    duration = 0.0
+
+    def fail(kind: str, why: str) -> None:
+        nonlocal verdict, reason
+        if verdict == "PASS":
+            verdict, reason = kind, why
+
+    try:
+        if not (wt / ".git").exists():
+            log.row("worktree", "ERROR", f"{wt} non esiste")
+            fail("ERROR", "worktree del job mancante")
+        else:
+            dirty = fl.git("status", "--porcelain", cwd=wt, check=False)
+            if dirty:
+                log.row("worktree pulito", "FAIL", "modifiche non committate:\n" + dirty)
+                fail("FAIL", "modifiche non committate nel worktree")
+            else:
+                log.row("worktree pulito", "PASS", "nessuna modifica pendente")
+            ahead = fl.git("rev-list", "--count", f"{base}..HEAD", cwd=wt, check=False) or "0"
+            if verdict == "PASS" and int(ahead) == 0:
+                log.row("commit", "FAIL", f"nessun commit rispetto a {base}")
+                fail("FAIL", f"il branch non ha commit rispetto a {base}")
+            elif verdict == "PASS":
+                log.row("commit", "PASS", f"{ahead} commit rispetto a {base}")
+            if verdict == "PASS" and args.final:
+                if fl.git_ok("merge-base", "--is-ancestor", base, "HEAD", cwd=wt):
+                    log.row("allineamento base", "PASS", f"{base} già incluso")
+                elif not cfg["gate"].get("final_rebase", True):
+                    log.row("allineamento base", "FAIL", f"{base} è avanzato e final_rebase è disattivato")
+                    fail("FAIL", f"il branch non include l'ultima {base}: aggiornalo (merge o rebase)")
+                else:
+                    proc = subprocess.run(["git", "rebase", base], cwd=str(wt), capture_output=True, text=True)
+                    log.line(proc.stdout + proc.stderr)
+                    if proc.returncode != 0:
+                        subprocess.run(["git", "rebase", "--abort"], cwd=str(wt), capture_output=True)
+                        log.row("allineamento base", "FAIL", "conflitti durante il rebase sulla base")
+                        fail("FAIL", f"conflitti con {base}: integra {base} nel branch e risolvi i conflitti")
+                    else:
+                        log.row("allineamento base", "PASS", f"rebase su {base} riuscito")
+            if verdict == "PASS":
+                changed = fl.git("diff", "--name-only", f"{base}...HEAD", cwd=wt, check=False).splitlines()
+                protected = [str(x) for x in cfg.get("protected_paths", [])]
+                touched = [f for f in changed if any(f == pp.rstrip("/") or f.startswith(pp) for pp in protected)]
+                if touched:
+                    log.row("file protetti", "FAIL", ", ".join(touched))
+                    fail("FAIL", "modificati file protetti: " + ", ".join(touched[:5]) + ". Ripristinali.")
+                else:
+                    log.row("file protetti", "PASS", f"{len(changed)} file modificati, nessuno protetto")
+            if verdict == "PASS":
+                code, duration = run_checks(cfg, job, wt, log)
+                if code == 0:
+                    log.row("checks.sh", "PASS", f"completato in {fl.fmt_duration(duration)}")
+                elif code is None:
+                    log.row("checks.sh", "FAIL", f"timeout dopo {fl.fmt_duration(duration)}")
+                    fail("FAIL", f"checks.sh in timeout ({cfg['gate'].get('timeout_minutes', 30)} min)")
+                elif code == EXIT_CONFIG:
+                    log.row("checks.sh", "ERROR", "stack non riconosciuto o checks.sh mancante")
+                    fail("ERROR", "checks.sh non sa cosa eseguire: personalizza factory/checks.sh o gate.check_dirs")
+                else:
+                    log.row("checks.sh", "FAIL", f"exit {code} dopo {fl.fmt_duration(duration)}")
+                    failed = [c for c in check_summary(log_path) if " FAIL" in c]
+                    fail("FAIL", "checks falliti: " + (", ".join(c.split()[0] for c in failed) or f"exit {code}"))
+    except fl.FactoryError as exc:
+        log.row("gate", "ERROR", str(exc))
+        fail("ERROR", str(exc))
+    finally:
+        log.close()
+
+    head = fl.git("rev-parse", "--short", "HEAD", cwd=wt, check=False) if (wt / ".git").exists() else ""
+    summary_text = reason or f"tutti i controlli superati su {head} ({fl.fmt_duration(duration)})"
+    rows = ["| Controllo | Esito | Dettaglio |", "| --- | --- | --- |"]
+    for name, res, detail in log.rows:
+        rows.append(f"| {name} | {res} | {detail.splitlines()[0] if detail else ''} |")
+    checks = check_summary(log_path)
+    body = [
+        "---",
+        f"verdict: {verdict}",
+        f"summary: \"{summary_text.replace(chr(34), chr(39))[:180]}\"",
+        f"head: {head}",
+        f"duration_s: {int(duration)}",
+        "---",
+        "",
+        f"# {'Gate finale' if args.final else 'Gate'} · ciclo {step['cycle']} round {step['round']}",
+        "",
+        *rows,
+        "",
+    ]
+    if checks:
+        body += ["## Check eseguiti", "", *[f"- `{c}`" for c in checks], ""]
+    body += [f"Log completo: `{log_path}`", "", "## Ultime righe del log", "", "```",
+             tail(log_path, int(cfg["gate"].get("log_tail_lines", 80))), "```", ""]
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(body), encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(fl.BIN_DIR / "job"), "finish", job["id"], role],
+                          capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

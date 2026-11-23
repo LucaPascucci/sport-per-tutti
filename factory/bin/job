@@ -1,0 +1,1051 @@
+#!/usr/bin/env python3
+"""factory/bin/job — unico script che scrive job.json.
+
+Gestisce la macchina a stati dei job e rifiuta i passaggi non validi.
+
+  python3 factory/bin/job new (--source FILE | --text TESTO | --stdin) [--title T]
+  python3 factory/bin/job ingest                      # crea job dai .md in factory/inbox/
+  python3 factory/bin/job dispatch --session S [--recover] [--ingest]
+  python3 factory/bin/job finish JOB RUOLO [--agent-id ID]
+  python3 factory/bin/job fail JOB RUOLO --reason TESTO
+  python3 factory/bin/job feedback JOB (--text TESTO | --file F | --stdin)
+  python3 factory/bin/job retry JOB | approve JOB | close JOB [--reason R] | cleanup JOB
+  python3 factory/bin/job list [--brief|--json|--all] | show JOB [--json]
+  python3 factory/bin/job cost [JOB ...] [--force] | index
+
+Codici di uscita: 0 ok, 2 uso errato, 3 passaggio rifiutato (report mancante,
+verdetto non valido, stadio sbagliato), 4 job non trovato.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as fl  # noqa: E402
+
+AGENT_ROLES_BY_STAGE = {"intake": "intake", "spec": "spec-writer", "build": "builder", "approval": "approver"}
+SCRIPT_ROLES_BY_STAGE = {"gate": "gate", "final-gate": "final-gate"}
+RUNNABLE = ("intake", "spec", "build", "gate", "review", "approval", "final-gate")
+WAITING = ("needs-info", "needs-human")
+TERMINAL = ("rejected", "done", "closed")
+PIPELINE = ["intake", "route", "spec", "build", "gate", "review", "approval", "final-gate", "done"]
+STAGE_RANK = {s: i for i, s in enumerate(PIPELINE)}
+
+VERDICTS = {
+    "intake": ("ACCEPT", "REJECT", "NEEDS-INFO"),
+    "spec-writer": ("DONE", "BLOCKED"),
+    "builder": ("DONE", "BLOCKED"),
+    "gate": ("PASS", "FAIL", "ERROR"),
+    "final-gate": ("PASS", "FAIL", "ERROR"),
+    "approver": ("APPROVE", "ESCALATE"),
+    **{r: ("PASS", "CHANGES") for r in fl.REVIEW_ROLES},
+}
+MAX_ATTEMPTS = 2
+
+
+class Rejected(fl.FactoryError):
+    """Passaggio di stato non valido (exit 3)."""
+
+
+# =========================================================================== persistenza
+
+def save_job(job: dict) -> None:
+    job["updated_at"] = fl.now_iso()
+    fl.write_json_atomic(fl.job_dir(job["id"]) / "job.json", job)
+
+
+def write_index() -> None:
+    jobs = fl.load_all_jobs()
+    cfg = fl.load_config()
+    data = {
+        "generated_at": fl.now_iso(),
+        "repo": fl.REPO_DIR.name,
+        "concurrency": cfg["concurrency"],
+        "max_rounds": cfg["max_rounds"],
+        "currency": cfg.get("pricing", {}).get("currency", "USD"),
+        "jobs": [summary(j) for j in jobs],
+    }
+    fl.write_json_atomic(fl.JOBS_DIR / "index.json", data)
+
+
+def summary(job: dict) -> dict:
+    end = job.get("finished_at") if job["stage"] in TERMINAL else None
+    return {
+        "id": job["id"],
+        "seq": job["seq"],
+        "title": job["title"],
+        "stage": job["stage"],
+        "status_reason": job.get("status_reason"),
+        "risk": job.get("risk"),
+        "surfaces": job.get("surfaces", []),
+        "labels": job.get("labels", []),
+        "round": job.get("round"),
+        "cycle": job.get("cycle"),
+        "branch": job.get("branch"),
+        "base": job.get("base"),
+        "created_at": job["created_at"],
+        "updated_at": job.get("updated_at"),
+        "finished_at": end,
+        "elapsed_s": fl.seconds_between(job["created_at"], end or fl.now_iso()),
+        "cost_usd": job.get("cost_usd", 0.0),
+        "tokens": job.get("tokens", {}),
+        "active": sorted(job.get("active", {}).keys()),
+        "routing": job.get("routing", []),
+        "question": job.get("question"),
+        "steps": [
+            {k: s.get(k) for k in ("n", "role", "stage", "kind", "model", "cycle", "round", "status",
+                                   "verdict", "summary", "started_at", "ended_at", "cost_usd", "report", "log")}
+            for s in job.get("steps", [])
+        ],
+    }
+
+
+# =========================================================================== transizioni
+
+def set_stage(cfg: dict, job: dict, stage: str, reason: str, resume_stage: str | None = None) -> None:
+    prev = job["stage"]
+    job["stage"] = stage
+    job["status_reason"] = reason
+    job.setdefault("history", []).append({"at": fl.now_iso(), "from": prev, "to": stage, "reason": reason})
+    labels = cfg["labels"]
+    key = stage if stage in labels else "in-progress"
+    job["labels"] = [labels[key]] if labels.get(key) else []
+    if stage == "needs-human":
+        job["resume_stage"] = resume_stage or "build"
+    if stage in TERMINAL:
+        job["finished_at"] = fl.now_iso()
+    else:
+        job.pop("finished_at", None)
+    if stage in WAITING or stage in TERMINAL:
+        job.setdefault("_events", []).append({"job": job["id"], "stage": stage, "reason": reason,
+                                               "title": job["title"]})
+
+
+def back_to_build(cfg: dict, job: dict, reason: str) -> None:
+    if job["round"] >= cfg["max_rounds"]:
+        set_stage(cfg, job, "needs-human",
+                  f"Limite di {cfg['max_rounds']} round raggiunto nel ciclo {job['cycle']}. Ultimo motivo: {reason}",
+                  resume_stage="build")
+    else:
+        job["round"] += 1
+        set_stage(cfg, job, "build", reason)
+
+
+def ensure_worktree(cfg: dict, job: dict) -> None:
+    wt = Path(job["worktree"])
+    if (wt / ".git").exists():
+        return
+    fl.git("worktree", "prune", check=False)
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if fl.branch_exists(job["branch"]):
+        fl.git("worktree", "add", str(wt), job["branch"])
+    else:
+        if not fl.branch_exists(job["base"]):
+            raise fl.FactoryError(f"il branch base {job['base']!r} non esiste")
+        fl.git("worktree", "add", "-b", job["branch"], str(wt), job["base"])
+    job["base_sha"] = fl.git("rev-parse", job["base"])
+
+
+def required_reviewers(job: dict) -> list[str]:
+    return [r["role"] for r in job.get("routing", [])]
+
+
+def review_results(job: dict) -> dict[str, str]:
+    return {
+        s["role"]: s["verdict"]
+        for s in job.get("steps", [])
+        if s["stage"] == "review" and s["cycle"] == job["cycle"] and s["round"] == job["round"]
+        and s["status"] == "done"
+    }
+
+
+def fresh(path: Path, step: dict) -> bool:
+    """Il file esiste ed è stato scritto durante questo step (non è un residuo di un round precedente)."""
+    started = fl.parse_iso(step.get("started_at"))
+    return path.exists() and (started is None or path.stat().st_mtime >= started.timestamp() - 5)
+
+
+def validate_report(cfg: dict, job: dict, role: str, fm: dict, step: dict) -> str:
+    verdict = str(fm.get("verdict", "")).strip().upper().replace("_", "-").replace(" ", "-")
+    if verdict not in VERDICTS[role]:
+        raise Rejected(f"verdetto {verdict or '(vuoto)'!r} non valido per {role}: attesi {', '.join(VERDICTS[role])}")
+    d = fl.job_dir(job["id"])
+    if role == "intake" and verdict == "ACCEPT":
+        risk = str(fm.get("risk", "")).strip().lower()
+        if risk not in fl.known_risks(cfg):
+            raise Rejected(f"intake ACCEPT senza rischio valido (risk: {risk or 'vuoto'}; ammessi {', '.join(fl.known_risks(cfg))})")
+    if role == "spec-writer" and verdict == "DONE" and not fresh(d / "spec.md", step):
+        raise Rejected("spec-writer DONE ma spec.md non esiste o non è stata scritta in questo step")
+    if role == "approver" and verdict == "APPROVE" and not fresh(d / "PR.md", step):
+        raise Rejected("approver APPROVE ma PR.md non esiste o non è stato scritto in questo step")
+    if role == "builder" and verdict == "DONE":
+        wt = Path(job["worktree"])
+        if fl.git("status", "--porcelain", cwd=wt, check=False):
+            raise Rejected("builder DONE con modifiche non committate nel worktree")
+    return verdict
+
+
+def apply_verdict(cfg: dict, job: dict, role: str, verdict: str, fm: dict, step: dict) -> None:
+    summary_text = step.get("summary") or verdict
+    if role == "intake":
+        if verdict == "ACCEPT":
+            job["risk"] = str(fm.get("risk")).strip().lower()
+            job["surfaces"] = fl.as_list(fm.get("surfaces"))
+            if fm.get("title"):
+                job["title"] = str(fm["title"]).strip()[:100]
+            job.pop("question", None)
+            set_stage(cfg, job, "route", f"intake: ACCEPT ({summary_text})")
+            routing = fl.compute_routing(cfg, job["risk"], job["surfaces"])
+            job["routing"] = routing
+            ts = fl.now_iso()
+            job["steps"].append({
+                "n": len(job["steps"]) + 1, "role": "route", "stage": "route", "kind": "script",
+                "model": None, "cycle": job["cycle"], "round": job["round"], "status": "done",
+                "verdict": "DONE", "started_at": ts, "ended_at": ts, "report": None, "cost_usd": 0.0,
+                "summary": "Reviewer: " + ", ".join(f"{r['role']} ({r['model']})" for r in routing),
+            })
+            set_stage(cfg, job, "spec", "route: reviewer e modelli scelti")
+        elif verdict == "REJECT":
+            set_stage(cfg, job, "rejected", summary_text)
+        else:
+            job["question"] = str(fm.get("question") or summary_text)
+            set_stage(cfg, job, "needs-info", job["question"])
+    elif role == "spec-writer":
+        if verdict == "DONE":
+            set_stage(cfg, job, "build", "spec pronta")
+        else:
+            set_stage(cfg, job, "needs-human", f"spec-writer bloccato: {summary_text}", resume_stage="spec")
+    elif role == "builder":
+        if verdict == "DONE":
+            set_stage(cfg, job, "gate", f"build round {job['round']} completato")
+        else:
+            set_stage(cfg, job, "needs-human", f"builder bloccato: {summary_text}", resume_stage="build")
+    elif role in ("gate", "final-gate"):
+        if verdict == "PASS":
+            if role == "gate":
+                set_stage(cfg, job, "review", "gate superato")
+            else:
+                set_stage(cfg, job, "done", "approvato e verificato: branch pronto per la PR/MR")
+                write_handoff(cfg, job, by_human=False)
+        elif verdict == "FAIL":
+            back_to_build(cfg, job, f"{role} FAIL: {summary_text}")
+        else:
+            set_stage(cfg, job, "needs-human", f"{role} ERROR (configurazione): {summary_text}", resume_stage=job["stage"])
+    elif role in fl.REVIEW_ROLES:
+        results = review_results(job)
+        pending = [r for r in required_reviewers(job) if r not in results]
+        if pending or any(r in job.get("active", {}) for r in fl.REVIEW_ROLES):
+            return
+        changes = [r for r, v in results.items() if v == "CHANGES"]
+        if changes:
+            back_to_build(cfg, job, "modifiche richieste da: " + ", ".join(changes))
+        else:
+            set_stage(cfg, job, "approval", "tutti i reviewer PASS")
+    elif role == "approver":
+        if verdict == "APPROVE":
+            forced = [str(r).lower() for r in cfg.get("approval", {}).get("always_escalate_risk", [])]
+            if job.get("risk") in forced:
+                set_stage(cfg, job, "needs-human",
+                          f"approvato dall'approver, ma il rischio {job['risk']} richiede una decisione umana",
+                          resume_stage="final-gate")
+            else:
+                set_stage(cfg, job, "final-gate", "approvato: verifica finale")
+        else:
+            set_stage(cfg, job, "needs-human", f"escalation dell'approver: {summary_text}", resume_stage="build")
+
+
+def write_handoff(cfg: dict, job: dict, by_human: bool) -> None:
+    d = fl.job_dir(job["id"])
+    wt = Path(job.get("worktree") or "")
+    head = fl.git("rev-parse", "--short", "HEAD", cwd=wt, check=False) if (wt / ".git").exists() else "?"
+    stat = fl.git("diff", "--shortstat", f"{job['base']}...{job['branch']}", check=False)
+    pr = d / "PR.md"
+    lines = [
+        f"# Job {job['id']} pronto per la PR/MR",
+        "",
+        f"**{job['title']}**",
+        "",
+        f"- Branch: `{job['branch']}` (base `{job['base']}`, HEAD `{head}`)",
+        f"- Modifiche: {stat or 'n/d'}",
+        f"- Rischio: {job.get('risk') or '-'} · superfici: {', '.join(job.get('surfaces', [])) or 'nessuna'}",
+        f"- Ciclo {job['cycle']} · round {job['round']} · costo stimato {job.get('cost_usd', 0):.2f} "
+        f"{cfg.get('pricing', {}).get('currency', 'USD')} (equivalente API)",
+        f"- Approvazione: {'umana (override)' if by_human else 'approver + gate finale'}",
+        "",
+        "## Crea la PR/MR",
+        "",
+        "```bash",
+        f"git push -u origin {job['branch']}",
+        "```",
+        "",
+        f"Usa il testo in `{pr.relative_to(fl.REPO_DIR)}` come titolo e descrizione." if pr.exists()
+        else "PR.md non presente: scrivi tu la descrizione.",
+        "",
+        "## Pulizia",
+        "",
+        f"Dopo il merge: `python3 factory/bin/job cleanup {job['id']}` (rimuove il worktree, non il branch).",
+        "",
+    ]
+    (d / "HANDOFF.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_notify(cfg: dict, events: list[dict]) -> None:
+    command = cfg.get("notify_command")
+    if not command or not events:
+        return
+    for ev in events:
+        env = dict(os.environ, FACTORY_JOB=ev["job"], FACTORY_STAGE=ev["stage"],
+                   FACTORY_TITLE=ev["title"], FACTORY_REASON=ev["reason"] or "")
+        try:
+            subprocess.Popen(command, shell=True, env=env, cwd=str(fl.REPO_DIR),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+
+
+def commit(cfg: dict, job: dict) -> list[dict]:
+    """Salva il job, aggiorna l'indice e restituisce gli eventi da notificare."""
+    events = job.pop("_events", [])
+    save_job(job)
+    write_index()
+    return events
+
+
+# =========================================================================== prompt per gli agenti
+
+def step_path(job: dict, step: dict | None, key: str = "report") -> str | None:
+    if not step or not step.get(key):
+        return None
+    return str(fl.job_dir(job["id"]) / step[key])
+
+
+def last_step(job: dict, **match) -> dict | None:
+    for s in reversed(job.get("steps", [])):
+        if all(s.get(k) == v for k, v in match.items()):
+            return s
+    return None
+
+
+def context_files(cfg: dict, job: dict, role: str) -> list[tuple[str, str]]:
+    d = fl.job_dir(job["id"])
+    c, r = job["cycle"], job["round"]
+    files: list[tuple[str, str]] = [("Richiesta originale", str(d / "request.md"))]
+    intake = last_step(job, role="intake", status="done")
+    feedback = job.get("feedback", [])
+    # Risposte dell'autore alle domande dell'intake: contesto per tutti.
+    answers = [f for f in feedback if f.get("stage") in ("needs-info", "rejected")]
+    # Feedback umano su un job già in lavorazione: istruzioni per il ciclo corrente.
+    human = [f for f in feedback if f.get("stage") not in ("needs-info", "rejected") and f.get("cycle") == c]
+    if role == "intake":
+        for s in job["steps"]:
+            if s["role"] == "intake" and s["status"] == "done":
+                files.append((f"Tuo intake precedente (step {s['n']}, {s['verdict']})", step_path(job, s)))
+        for f in answers:
+            files.append((f"Risposta dell'autore #{f['n']}", str(d / f["file"])))
+        return files
+    for f in answers:
+        files.append((f"Risposta dell'autore all'intake #{f['n']}", str(d / f["file"])))
+    if intake:
+        files.append(("Report di intake", step_path(job, intake)))
+    if role != "spec-writer" and (d / "spec.md").exists():
+        files.append(("Spec", str(d / "spec.md")))
+    if role == "spec-writer":
+        for f in human:
+            files.append((f"Feedback umano #{f['n']}", str(d / f["file"])))
+        prev = last_step(job, role="spec-writer", status="done")
+        if prev:
+            files.append(("Tuo report precedente", step_path(job, prev)))
+        if (d / "spec.md").exists():
+            files.append(("Spec attuale da aggiornare", str(d / "spec.md")))
+        return files
+    if role == "builder":
+        if r > 1:
+            for s in job["steps"]:
+                if s["cycle"] == c and s["round"] == r - 1 and s["status"] == "done" and \
+                        s.get("verdict") in ("FAIL", "CHANGES", "ERROR"):
+                    files.append((f"DA RISOLVERE: {s['role']} {s['verdict']}", step_path(job, s)))
+                    if s.get("log"):
+                        files.append((f"Log completo {s['role']}", step_path(job, s, "log")))
+        elif c > 1:
+            prev_c = [s for s in job["steps"] if s["cycle"] == c - 1 and s["status"] == "done"]
+            last_r = max((s["round"] for s in prev_c), default=0)
+            seen = set()
+            for s in prev_c:
+                if s["round"] == last_r and s.get("verdict") in ("FAIL", "CHANGES", "ERROR", "ESCALATE", "BLOCKED"):
+                    files.append((f"Esito del ciclo precedente: {s['role']} {s['verdict']}", step_path(job, s)))
+                    seen.add(s["report"])
+            if job.get("escalation_report") and job["escalation_report"] not in seen:
+                files.append(("Motivo dell'escalation", str(d / job["escalation_report"])))
+        for f in human:
+            files.append((f"DA RISOLVERE: feedback umano #{f['n']}", str(d / f["file"])))
+        prev = last_step(job, role="builder", status="done")
+        if prev:
+            files.append(("Tuo report precedente", step_path(job, prev)))
+        return files
+    builder = last_step(job, role="builder", status="done")
+    if builder:
+        files.append(("Report del builder (ultimo round)", step_path(job, builder)))
+    gate = last_step(job, role="gate", status="done", verdict="PASS")
+    if gate:
+        files.append(("Report del gate", step_path(job, gate)))
+    if role in fl.REVIEW_ROLES:
+        mine = last_step(job, role=role, status="done", cycle=c)
+        if mine and mine["round"] < r:
+            files.append((f"Tua review del round {mine['round']} (verifica le correzioni)", step_path(job, mine)))
+        for f in human:
+            files.append((f"Feedback umano #{f['n']}", str(d / f["file"])))
+        return files
+    if role == "approver":
+        for s in job["steps"]:
+            if s["stage"] == "review" and s["cycle"] == c and s["round"] == r and s["status"] == "done":
+                files.append((f"Review {s['role']} ({s['verdict']})", step_path(job, s)))
+        for f in human:
+            files.append((f"Feedback umano #{f['n']} (verifica che sia stato applicato)", str(d / f["file"])))
+    return files
+
+
+OUTPUT_FIELDS = {
+    "intake": [
+        "risk: {risks}            # obbligatorio se ACCEPT",
+        "surfaces: [{surfaces}]   # sottoinsieme; [] se nessuna",
+        "title: <titolo breve e chiaro>",
+        "question: <domanda all'autore>   # solo se NEEDS-INFO",
+    ],
+    "builder": ["commits: <numero di commit del round>"],
+    "approver": ["pr_title: <titolo della PR in formato Conventional Commits>"],
+}
+
+ROLE_TASK = {
+    "intake": "Valuta la richiesta: decidi se costruirla, riduci lo scope, assegna rischio e superfici.",
+    "spec-writer": "Scrivi la spec tecnica in {job_dir}/spec.md, poi il report.",
+    "builder": "Implementa la spec nel worktree del job, con test, e committa sul branch del job.",
+    "code-review": "Fai la code review del diff: correttezza, aderenza alla spec, scope, test.",
+    "ux-review": "Fai la review UX del diff: flussi, testi, stati, accessibilità.",
+    "ui-review": "Fai la review UI del diff: aspetto, coerenza visiva, responsive, temi.",
+    "security-review": "Fai la security review del diff: autenticazione, permessi, input, segreti.",
+    "approver": "Decidi APPROVE o ESCALATE. Se APPROVE, scrivi {job_dir}/PR.md con titolo e descrizione della PR/MR.",
+}
+
+
+def render_prompt(cfg: dict, job: dict, role: str, step: dict) -> str:
+    d = fl.job_dir(job["id"])
+    report = d / step["report"]
+    out = [
+        f"# Factory · job {job['id']} · {role}",
+        "",
+        ROLE_TASK[role].format(job_dir=d),
+        "",
+        f"- Titolo: {job['title']}",
+        f"- Ciclo {job['cycle']} · round {job['round']} di {cfg['max_rounds']}",
+    ]
+    if job.get("risk"):
+        out.append(f"- Rischio: {job['risk']} · superfici: {', '.join(job.get('surfaces', [])) or 'nessuna'}")
+    out.append(f"- Repository principale (non modificarlo): {fl.REPO_DIR}")
+    out.append(f"- Cartella del job: {d}")
+    if role != "intake":
+        out += [
+            f"- Worktree del job: {job['worktree']}",
+            f"- Branch: {job['branch']} · base: {job['base']}",
+            f"- Diff del job: git -C {job['worktree']} diff {job['base']}...HEAD",
+        ]
+    if role in fl.REVIEW_ROLES:
+        others = [r["role"] for r in job.get("routing", []) if r["role"] != role]
+        out.append(f"- Altri reviewer in parallelo: {', '.join(others) or 'nessuno'} (resta nel tuo ambito)")
+    out += ["", "## Da leggere", ""]
+    for label, path in context_files(cfg, job, role):
+        out.append(f"- {label}: {path}")
+    out += ["", "## Output", "", f"Scrivi il report in `{report}`. Deve iniziare con questo front matter:", "", "```", "---",
+            f"verdict: {' | '.join(VERDICTS[role])}", "summary: <una riga, max 120 caratteri>"]
+    for line in OUTPUT_FIELDS.get(role, []):
+        out.append(line.format(risks=" | ".join(fl.known_risks(cfg)), surfaces=", ".join(fl.known_surfaces(cfg))))
+    out += ["---", "```", "",
+            "Segui il formato del corpo descritto nelle tue istruzioni di ruolo.",
+            "Non eseguire factory/bin/job: lo stato lo aggiorna l'orchestratore.",
+            f"Ultima riga della risposta finale: REPORT {report}"]
+    return "\n".join(out)
+
+
+def start_step(cfg: dict, job: dict, role: str, session: str) -> dict:
+    n = len(job["steps"]) + 1
+    kind = "script" if role in ("gate", "final-gate") else "agent"
+    report = f"steps/{n:02d}-{role}-c{job['cycle']}r{job['round']}.md"
+    step = {
+        "n": n, "role": role, "stage": job["stage"], "kind": kind, "cycle": job["cycle"], "round": job["round"],
+        "status": "running", "verdict": None, "summary": None, "session": session, "started_at": fl.now_iso(),
+        "ended_at": None, "report": report, "cost_usd": None, "agent_id": None,
+    }
+    payload = {"job": job["id"], "role": role, "step": n, "kind": kind, "report": str(fl.job_dir(job["id"]) / report)}
+    if kind == "script":
+        step["model"] = None
+        step["log"] = f"logs/{n:02d}-{role}.log"
+        final = " --final" if role == "final-gate" else ""
+        payload["command"] = f"python3 factory/bin/gate {job['id']}{final}"
+        payload["run_in_background"] = True
+    else:
+        if role in fl.REVIEW_ROLES:
+            route = next((r for r in job.get("routing", []) if r["role"] == role), None)
+            model = route["model"] if route else fl.agent_model(cfg, role)
+        else:
+            model = fl.agent_model(cfg, role)
+        step["model"] = model
+        payload.update({
+            "agent": fl.agent_name(cfg, role),
+            "model": model,
+            "description": f"{role} job {job['seq']}",
+        })
+    job["steps"].append(step)
+    job.setdefault("active", {})[role] = n
+    if kind == "agent":
+        payload["prompt"] = render_prompt(cfg, job, role, step)
+    return payload
+
+
+# =========================================================================== comandi
+
+def read_text_arg(args) -> str:
+    if getattr(args, "stdin", False):
+        return sys.stdin.read()
+    if getattr(args, "file", None):
+        return Path(args.file).read_text(encoding="utf-8")
+    if getattr(args, "source", None):
+        return Path(args.source).read_text(encoding="utf-8")
+    return args.text or ""
+
+
+def create_job(cfg: dict, text: str, source: str, title: str | None) -> dict:
+    if not text.strip():
+        raise Rejected("richiesta vuota")
+    title = (title or fl.extract_title(text)).strip()
+    ids = fl.all_job_ids()
+    seq = max((int(i.split("-", 1)[0]) for i in ids if i.split("-", 1)[0].isdigit()), default=0) + 1
+    jid = f"{seq:04d}-{fl.slugify(title)}"
+    d = fl.job_dir(jid)
+    for sub in ("steps", "logs", "feedback"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    (d / "request.md").write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    base = fl.detect_base_branch(cfg)
+    ts = fl.now_iso()
+    job = {
+        "id": jid, "seq": seq, "title": title, "source": source, "created_at": ts, "updated_at": ts,
+        "stage": "intake", "status_reason": "in attesa di intake", "risk": None, "surfaces": [],
+        "routing": [], "cycle": 1, "round": 1, "base": base, "base_sha": None,
+        "branch": f"{cfg['branch_prefix']}{jid}", "worktree": str(fl.worktrees_root(cfg) / jid),
+        "labels": [cfg["labels"].get("in-progress")] if cfg["labels"].get("in-progress") else [],
+        "steps": [], "active": {}, "attempts": {}, "feedback": [],
+        "history": [{"at": ts, "from": None, "to": "intake", "reason": f"creato da {source}"}],
+        "cost_usd": 0.0, "tokens": {},
+    }
+    save_job(job)
+    return job
+
+
+def cmd_new(args) -> int:
+    cfg = fl.load_config()
+    text = read_text_arg(args)
+    source = args.source or ("stdin" if args.stdin else "testo")
+    with fl.locked():
+        job = create_job(cfg, text, source, args.title)
+        write_index()
+    print(json.dumps({"job": job["id"], "stage": job["stage"], "title": job["title"], "base": job["base"]},
+                     ensure_ascii=False))
+    return 0
+
+
+def ingest(cfg: dict) -> list[dict]:
+    created = []
+    if not fl.INBOX_DIR.exists():
+        return created
+    done_dir = fl.INBOX_DIR / "processed"
+    for path in sorted(fl.INBOX_DIR.glob("*.md")):
+        if path.name.startswith(".") or path.name.lower() == "readme.md":
+            continue
+        job = create_job(cfg, path.read_text(encoding="utf-8"), f"inbox/{path.name}", None)
+        done_dir.mkdir(exist_ok=True)
+        target = done_dir / f"{job['id']}--{path.name}"
+        shutil.move(str(path), str(target))
+        created.append({"job": job["id"], "title": job["title"], "from": path.name})
+    return created
+
+
+def cmd_ingest(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        created = ingest(cfg)
+        write_index()
+    print(json.dumps({"created": created}, ensure_ascii=False))
+    return 0
+
+
+def cmd_dispatch(args) -> int:
+    cfg = fl.load_config()
+    problems = fl.validate_config(cfg)
+    if problems:
+        raise fl.FactoryError("config.json non valido:\n- " + "\n- ".join(problems))
+    events: list[dict] = []
+    out: dict = {"session": args.session, "concurrency": cfg["concurrency"], "created": [], "recovered": [],
+                 "dispatch": [], "running": [], "waiting": [], "errors": []}
+    with fl.locked():
+        if args.ingest:
+            out["created"] = ingest(cfg)
+        jobs = fl.load_all_jobs()
+        for job in jobs:
+            changed = False
+            for role, n in list(job.get("active", {}).items()):
+                step = job["steps"][n - 1]
+                if args.recover or step.get("session") != args.session:
+                    step["status"] = "interrupted"
+                    step["ended_at"] = fl.now_iso()
+                    del job["active"][role]
+                    out["recovered"].append({"job": job["id"], "role": role, "step": n})
+                    changed = True
+            if changed:
+                job.setdefault("history", []).append({"at": fl.now_iso(), "from": job["stage"], "to": job["stage"],
+                                                      "reason": "step interrotti ripresi"})
+                events += commit(cfg, job)
+        in_flight = {j["id"] for j in jobs if j.get("active")}
+        free = cfg["concurrency"] - len(in_flight)
+
+        def priority(j: dict):
+            return (0 if j["id"] in in_flight else 1, -STAGE_RANK.get(j["stage"], 0), j["seq"])
+
+        for job in sorted(jobs, key=priority):
+            if job["stage"] in WAITING:
+                out["waiting"].append({"job": job["id"], "stage": job["stage"], "reason": job.get("status_reason"),
+                                       "question": job.get("question")})
+                continue
+            if job["stage"] not in RUNNABLE:
+                continue
+            if job["stage"] == "review":
+                done = review_results(job)
+                roles = [r for r in required_reviewers(job) if r not in done and r not in job.get("active", {})]
+            else:
+                role = AGENT_ROLES_BY_STAGE.get(job["stage"]) or SCRIPT_ROLES_BY_STAGE.get(job["stage"])
+                roles = [role] if role and role not in job.get("active", {}) else []
+            if not roles:
+                continue
+            if job["id"] not in in_flight:
+                if free <= 0:
+                    continue
+                free -= 1
+                in_flight.add(job["id"])
+            try:
+                if job["stage"] != "intake":
+                    ensure_worktree(cfg, job)
+                for role in roles:
+                    out["dispatch"].append(start_step(cfg, job, role, args.session))
+            except fl.FactoryError as exc:
+                set_stage(cfg, job, "needs-human", f"errore di preparazione: {exc}", resume_stage=job["stage"])
+                out["errors"].append({"job": job["id"], "error": str(exc)})
+            events += commit(cfg, job)
+        for job in fl.load_all_jobs():
+            if job.get("active"):
+                out["running"].append({"job": job["id"], "stage": job["stage"], "roles": sorted(job["active"])})
+        write_index()
+    out["events"] = events
+    out["idle"] = not out["dispatch"] and not out["running"]
+    run_notify(cfg, events)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
+def update_step_cost(cfg: dict, job: dict, step: dict) -> None:
+    if step.get("kind") != "agent":
+        return
+    marker = step_path(job, step)
+    path = fl.find_transcript(cfg, step.get("agent_id"), marker, step.get("started_at"))
+    if not path:
+        return
+    try:
+        info = fl.transcript_cost(cfg, path)
+    except OSError:
+        return
+    step["cost_usd"] = info["cost_usd"]
+    step["tokens"] = info["tokens"]
+    step["models_used"] = info["models"]
+    if info["unpriced_models"]:
+        step["unpriced_models"] = info["unpriced_models"]
+
+
+def recompute_totals(job: dict) -> None:
+    total = 0.0
+    tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    for s in job.get("steps", []):
+        total += s.get("cost_usd") or 0.0
+        for k in tokens:
+            tokens[k] += (s.get("tokens") or {}).get(k, 0)
+    job["cost_usd"] = round(total, 4)
+    job["tokens"] = tokens
+
+
+def get_active_step(job: dict, role: str) -> dict:
+    if role not in VERDICTS:
+        raise Rejected(f"ruolo sconosciuto: {role}")
+    n = job.get("active", {}).get(role)
+    if not n:
+        raise Rejected(f"nessuno step attivo per {role} nel job {job['id']} (stadio {job['stage']})")
+    return job["steps"][n - 1]
+
+
+def cmd_finish(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        step = get_active_step(job, args.role)
+        report = fl.job_dir(job["id"]) / step["report"]
+        if not report.exists():
+            raise Rejected(f"report mancante: {report}. Se l'agente non lo ha scritto usa: job fail {job['id']} {args.role}")
+        fm, body = fl.parse_front_matter(report.read_text(encoding="utf-8"))
+        verdict = validate_report(cfg, job, args.role, fm, step)
+        first_line = next((ln.strip("# ").strip() for ln in body.splitlines() if ln.strip()), "")
+        step.update({"status": "done", "verdict": verdict, "ended_at": fl.now_iso(),
+                     "summary": str(fm.get("summary") or first_line)[:200]})
+        if args.agent_id:
+            step["agent_id"] = args.agent_id
+        if args.role in ("gate", "final-gate"):
+            step["head"] = str(fm.get("head") or "")
+        del job["active"][args.role]
+        job.setdefault("attempts", {})[args.role] = 0
+        update_step_cost(cfg, job, step)
+        recompute_totals(job)
+        apply_verdict(cfg, job, args.role, verdict, fm, step)
+        if job["stage"] == "needs-human":
+            job["escalation_report"] = step["report"]
+        events = commit(cfg, job)
+    run_notify(cfg, events)
+    print(json.dumps({"job": job["id"], "role": args.role, "verdict": verdict, "stage": job["stage"],
+                      "round": job["round"], "cycle": job["cycle"], "reason": job.get("status_reason"),
+                      "events": events, "cost_usd": step.get("cost_usd")}, ensure_ascii=False))
+    return 0
+
+
+def cmd_fail(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        step = get_active_step(job, args.role)
+        step.update({"status": "failed", "ended_at": fl.now_iso(), "summary": f"errore: {args.reason}"[:200]})
+        if args.agent_id:
+            step["agent_id"] = args.agent_id
+        del job["active"][args.role]
+        attempts = job.setdefault("attempts", {})
+        attempts[args.role] = attempts.get(args.role, 0) + 1
+        update_step_cost(cfg, job, step)
+        recompute_totals(job)
+        if attempts[args.role] >= MAX_ATTEMPTS:
+            set_stage(cfg, job, "needs-human", f"{args.role} fallito {attempts[args.role]} volte: {args.reason}",
+                      resume_stage=job["stage"])
+        events = commit(cfg, job)
+    run_notify(cfg, events)
+    print(json.dumps({"job": job["id"], "role": args.role, "stage": job["stage"], "attempts": attempts[args.role],
+                      "events": events}, ensure_ascii=False))
+    return 0
+
+
+def resume_from_human(cfg: dict, job: dict, reason: str, target: str) -> None:
+    """Riparte da needs-human/done. Verso build apre un nuovo ciclo con round azzerati."""
+    if target == "build":
+        job["cycle"] += 1
+        job["round"] = 1
+    job["attempts"] = {}
+    set_stage(cfg, job, target, reason)
+
+
+def cmd_feedback(args) -> int:
+    cfg = fl.load_config()
+    text = read_text_arg(args)
+    if not text.strip():
+        raise Rejected("feedback vuoto")
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        if job["stage"] == "closed":
+            raise Rejected("job chiuso: crea una nuova richiesta")
+        stage = job["stage"]
+        n = len(job.get("feedback", [])) + 1
+        rel = f"feedback/{n:02d}.md"
+        (fl.job_dir(job["id"]) / rel).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        if stage in ("needs-info", "rejected"):
+            action = "intake"
+            set_stage(cfg, job, "intake", f"risposta dell'autore (feedback #{n})")
+        elif stage in ("needs-human", "done"):
+            # Un feedback scritto porta istruzioni nuove: riparte dal builder (nuovo ciclo),
+            # tranne quando era bloccata la spec. Per riprendere dallo stesso punto c'è `retry`.
+            target = "spec" if stage == "needs-human" and job.get("resume_stage") == "spec" else "build"
+            resume_from_human(cfg, job, f"feedback umano #{n}", target)
+            action = job["stage"]
+        else:
+            action = "in coda: lo userà il prossimo step"
+        job.setdefault("feedback", []).append({"n": n, "file": rel, "at": fl.now_iso(), "stage": stage,
+                                               "cycle": job["cycle"]})
+        events = commit(cfg, job)
+    print(json.dumps({"job": job["id"], "feedback": n, "from": stage, "stage": job["stage"], "action": action,
+                      "cycle": job["cycle"], "round": job["round"], "events": events}, ensure_ascii=False))
+    return 0
+
+
+def cmd_retry(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        if job["stage"] != "needs-human":
+            raise Rejected(f"retry valido solo da needs-human (stadio attuale: {job['stage']})")
+        resume_from_human(cfg, job, "retry richiesto dall'umano", job.get("resume_stage") or "build")
+        commit(cfg, job)
+    print(json.dumps({"job": job["id"], "stage": job["stage"], "cycle": job["cycle"], "round": job["round"]}))
+    return 0
+
+
+def cmd_approve(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        if job["stage"] != "needs-human":
+            raise Rejected(f"approve valido solo da needs-human (stadio attuale: {job['stage']})")
+        if not (Path(job["worktree"]) / ".git").exists() and not fl.branch_exists(job["branch"]):
+            raise Rejected("nessun branch da approvare")
+        set_stage(cfg, job, "done", "approvato dall'umano" + (f": {args.note}" if args.note else ""))
+        write_handoff(cfg, job, by_human=True)
+        events = commit(cfg, job)
+    print(json.dumps({"job": job["id"], "stage": job["stage"], "events": events}, ensure_ascii=False))
+    return 0
+
+
+def cmd_close(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        if job.get("active"):
+            raise Rejected(f"step in corso ({', '.join(job['active'])}): attendi o interrompi prima")
+        if job["stage"] == "closed":
+            raise Rejected("job già chiuso")
+        set_stage(cfg, job, "closed", args.reason or "chiuso dall'umano")
+        events = commit(cfg, job)
+    print(json.dumps({"job": job["id"], "stage": "closed", "events": events}, ensure_ascii=False))
+    return 0
+
+
+def cmd_cleanup(args) -> int:
+    with fl.locked():
+        job = fl.load_job(fl.resolve_job_id(args.job))
+        if job["stage"] not in TERMINAL:
+            raise Rejected(f"cleanup solo per job done/rejected/closed (stadio: {job['stage']})")
+        wt = Path(job["worktree"])
+        removed = False
+        if wt.exists():
+            fl.git("worktree", "remove", "--force", str(wt))
+            removed = True
+        fl.git("worktree", "prune", check=False)
+        deleted_branch = False
+        if args.delete_branch and fl.branch_exists(job["branch"]):
+            fl.git("branch", "-D", job["branch"])
+            deleted_branch = True
+        job["worktree_removed"] = True
+        save_job(job)
+        write_index()
+    print(json.dumps({"job": job["id"], "worktree_removed": removed, "branch_deleted": deleted_branch}))
+    return 0
+
+
+def cmd_cost(args) -> int:
+    cfg = fl.load_config()
+    with fl.locked():
+        ids = [fl.resolve_job_id(j) for j in args.jobs] if args.jobs else fl.all_job_ids()
+        report = []
+        for jid in ids:
+            job = fl.load_job(jid)
+            for step in job.get("steps", []):
+                if step.get("kind") == "agent" and step.get("status") != "running" and \
+                        (args.force or step.get("cost_usd") is None):
+                    update_step_cost(cfg, job, step)
+            recompute_totals(job)
+            save_job(job)
+            missing = [s["n"] for s in job["steps"] if s.get("kind") == "agent" and s.get("cost_usd") is None
+                       and s.get("status") != "running"]
+            report.append({"job": jid, "cost_usd": job["cost_usd"], "steps_without_transcript": missing})
+        write_index()
+    print(json.dumps({"currency": cfg["pricing"].get("currency", "USD"), "jobs": report}, ensure_ascii=False))
+    return 0
+
+
+def cmd_index(args) -> int:
+    with fl.locked():
+        write_index()
+    print(str(fl.JOBS_DIR / "index.json"))
+    return 0
+
+
+def brief_line(job: dict, currency: str) -> str:
+    stage = job["stage"]
+    tag = f"{stage}"
+    if stage in RUNNABLE:
+        tag += f" c{job['cycle']}r{job['round']}"
+    if job.get("active"):
+        tag += " > " + ",".join(sorted(job["active"]))
+    risk = job.get("risk") or "-"
+    surf = ",".join(job.get("surfaces", [])) or "-"
+    reason = job.get("status_reason") or ""
+    if len(reason) > 90:
+        reason = reason[:87] + "..."
+    return f"{job['id']:<44} {tag:<28} rischio={risk:<6} sup={surf:<12} {job.get('cost_usd', 0):>6.2f} {currency}  {reason}"
+
+
+def cmd_list(args) -> int:
+    cfg = fl.load_config()
+    jobs = fl.load_all_jobs()
+    if args.json:
+        print(json.dumps([summary(j) for j in jobs], ensure_ascii=False, indent=1))
+        return 0
+    currency = cfg.get("pricing", {}).get("currency", "USD")
+    if not args.all:
+        recent_terminal = [j for j in jobs if j["stage"] in TERMINAL][-5:]
+        jobs = [j for j in jobs if j["stage"] not in TERMINAL] + recent_terminal
+    if not jobs:
+        print("Nessun job. Crea una richiesta con /factory run <file.md> o /factory <testo>.")
+        return 0
+    if args.brief:
+        counts: dict[str, int] = {}
+        for j in fl.load_all_jobs():
+            counts[j["stage"]] = counts.get(j["stage"], 0) + 1
+        print("Job per stadio: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    for job in jobs:
+        print(brief_line(job, currency))
+    return 0
+
+
+def cmd_show(args) -> int:
+    cfg = fl.load_config()
+    job = fl.load_job(fl.resolve_job_id(args.job))
+    if args.json:
+        print(json.dumps(job, ensure_ascii=False, indent=1))
+        return 0
+    d = fl.job_dir(job["id"])
+    currency = cfg.get("pricing", {}).get("currency", "USD")
+    print(f"{job['id']} — {job['title']}")
+    print(f"stadio: {job['stage']} · motivo: {job.get('status_reason')}")
+    print(f"rischio: {job.get('risk') or '-'} · superfici: {', '.join(job.get('surfaces', [])) or '-'} · "
+          f"ciclo {job['cycle']} round {job['round']}/{cfg['max_rounds']}")
+    print(f"branch: {job['branch']} (base {job['base']}) · worktree: {job['worktree']}")
+    if job.get("routing"):
+        print("reviewer: " + ", ".join(f"{r['role']}={r['model']} ({r['model_source']})" for r in job["routing"]))
+    print(f"costo stimato: {job.get('cost_usd', 0):.4f} {currency} · cartella: {d}")
+    if job.get("question"):
+        print(f"domanda aperta: {job['question']}")
+    print("\nstep:")
+    for s in job.get("steps", []):
+        dur = fl.fmt_duration(fl.seconds_between(s.get("started_at"), s.get("ended_at") or fl.now_iso()))
+        cost = "-" if s.get("cost_usd") is None else f"{s['cost_usd']:.4f}"
+        print(f"  {s['n']:>2}. c{s['cycle']}r{s['round']} {s['role']:<16} {str(s.get('model') or ''):<7} "
+              f"{s['status']:<11} {str(s.get('verdict') or ''):<10} {dur:>7} {cost:>8}  {s.get('summary') or ''}")
+        if s.get("report"):
+            print(f"      report: {d / s['report']}")
+    return 0
+
+
+# =========================================================================== main
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="job", description="Stato dei job della software factory (unico writer di job.json).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("new", help="crea un job da markdown o testo")
+    src = sp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--source")
+    src.add_argument("--text")
+    src.add_argument("--stdin", action="store_true")
+    sp.add_argument("--title")
+    sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("ingest", help="crea job dai file in factory/inbox/")
+    sp.set_defaults(func=cmd_ingest)
+
+    sp = sub.add_parser("dispatch", help="avvia gli step eseguibili rispettando la concorrenza")
+    sp.add_argument("--session", required=True)
+    sp.add_argument("--recover", action="store_true", help="considera interrotti tutti gli step in corso")
+    sp.add_argument("--ingest", action="store_true", help="prima crea i job dalla inbox")
+    sp.set_defaults(func=cmd_dispatch)
+
+    sp = sub.add_parser("finish", help="registra il report di uno step e applica la transizione")
+    sp.add_argument("job")
+    sp.add_argument("role")
+    sp.add_argument("--agent-id")
+    sp.set_defaults(func=cmd_finish)
+
+    sp = sub.add_parser("fail", help="registra uno step fallito (agente in errore o senza report)")
+    sp.add_argument("job")
+    sp.add_argument("role")
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--agent-id")
+    sp.set_defaults(func=cmd_fail)
+
+    sp = sub.add_parser("feedback", help="aggiunge un feedback umano e riavvia il job se in attesa")
+    sp.add_argument("job")
+    src = sp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--text")
+    src.add_argument("--file")
+    src.add_argument("--stdin", action="store_true")
+    sp.set_defaults(func=cmd_feedback)
+
+    for name, func, helptext in (("retry", cmd_retry, "riprende un job needs-human senza feedback"),):
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("job")
+        sp.set_defaults(func=func)
+
+    sp = sub.add_parser("approve", help="override umano: needs-human -> done")
+    sp.add_argument("job")
+    sp.add_argument("--note")
+    sp.set_defaults(func=cmd_approve)
+
+    sp = sub.add_parser("close", help="chiude un job")
+    sp.add_argument("job")
+    sp.add_argument("--reason")
+    sp.set_defaults(func=cmd_close)
+
+    sp = sub.add_parser("cleanup", help="rimuove il worktree di un job concluso")
+    sp.add_argument("job")
+    sp.add_argument("--delete-branch", action="store_true")
+    sp.set_defaults(func=cmd_cleanup)
+
+    sp = sub.add_parser("cost", help="ricalcola i costi dalle trascrizioni di Claude Code")
+    sp.add_argument("jobs", nargs="*")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_cost)
+
+    sp = sub.add_parser("index", help="rigenera factory/jobs/index.json")
+    sp.set_defaults(func=cmd_index)
+
+    sp = sub.add_parser("list", help="elenco dei job")
+    sp.add_argument("--brief", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--all", action="store_true")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("show", help="dettaglio di un job")
+    sp.add_argument("job")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_show)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except Rejected as exc:
+        print(f"RIFIUTATO: {exc}", file=sys.stderr)
+        return 3
+    except fl.FactoryError as exc:
+        msg = str(exc)
+        print(f"ERRORE: {msg}", file=sys.stderr)
+        return 4 if msg.startswith("job non trovato") else 1
+    except OSError as exc:
+        print(f"ERRORE: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

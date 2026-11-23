@@ -1,0 +1,84 @@
+{
+  "_doc": "Configurazione della software factory. Le chiavi che iniziano con _ sono commenti. Verifica con: python3 factory/bin/route --check",
+
+  "concurrency": 3,
+  "max_rounds": 3,
+  "base_branch": "auto",
+  "branch_prefix": "factory/",
+  "worktrees_dir": "../{repo}.factory-worktrees",
+  "protected_paths": ["factory/", ".claude/"],
+
+  "_agents": "Modello esplicito per ogni agente: haiku | sonnet | opus | fable. null = tabella di routing (reviewer) o default (intake fable, gli altri opus). Il valore esplicito vince sempre sulla tabella.",
+  "agents": {
+    "intake":          { "agent": "factory-intake",            "model": "fable" },
+    "spec-writer":     { "agent": "factory-spec-writer",       "model": "opus" },
+    "builder":         { "agent": "factory-builder",           "model": "opus" },
+    "code-review":     { "agent": "factory-code-reviewer",     "model": null },
+    "ux-review":       { "agent": "factory-ux-reviewer",       "model": null },
+    "ui-review":       { "agent": "factory-ui-reviewer",       "model": null },
+    "security-review": { "agent": "factory-security-reviewer", "model": null },
+    "approver":        { "agent": "factory-approver",          "model": "opus" }
+  },
+
+  "_routing": "Reviewer = unione della riga del rischio e delle righe delle superfici segnalate dall'intake. Se lo stesso reviewer compare due volte vince il modello più capace.",
+  "routing": {
+    "risk": {
+      "low":    { "code-review": "haiku" },
+      "medium": { "code-review": "sonnet" },
+      "high":   { "code-review": "sonnet" }
+    },
+    "surfaces": {
+      "ui":       { "ux-review": "sonnet", "ui-review": "haiku" },
+      "security": { "security-review": "opus" }
+    }
+  },
+
+  "approval": {
+    "_always_escalate_risk": "Rischi per cui anche un APPROVE va all'umano, es. [\"high\"].",
+    "always_escalate_risk": []
+  },
+
+  "gate": {
+    "timeout_minutes": 30,
+    "final_rebase": true,
+    "_check_dirs": "Cartelle in cui checks.sh cerca lo stack, es. [\"backend\", \"frontend\"]. Vuoto = rilevamento automatico.",
+    "check_dirs": [],
+    "log_tail_lines": 80
+  },
+
+  "labels": {
+    "in-progress": "factory:in-progress",
+    "needs-info":  "factory:needs-info",
+    "needs-human": "factory:needs-human",
+    "done":        "factory:done",
+    "rejected":    "factory:rejected",
+    "closed":      "factory:closed"
+  },
+
+  "_notify_command": "Comando shell eseguito quando un job va in done, needs-human, needs-info o rejected. Variabili: FACTORY_JOB, FACTORY_STAGE, FACTORY_TITLE, FACTORY_REASON. Esempio macOS: osascript -e \"display notification \\\"$FACTORY_STAGE\\\" with title \\\"$FACTORY_JOB\\\"\"",
+  "notify_command": null,
+
+  "_transcripts_dir": "auto = $CLAUDE_CONFIG_DIR o ~/.claude. Serve per stimare i costi dalle trascrizioni dei subagent.",
+  "transcripts_dir": "auto",
+
+  "pricing": {
+    "_note": "USD per milione di token, listino Claude API (platform.claude.com/docs/en/about-claude/pricing, verificato il 2026-11-23). Prezzo equivalente API: non è la fattura di un abbonamento.",
+    "currency": "USD",
+    "models": {
+      "claude-fable-5-2":  { "input": 8.0,  "output": 40.0, "cache_write_5m": 10.0,  "cache_write_1h": 16.0, "cache_read": 0.20 },
+      "claude-fable-5-1":  { "input": 10.0, "output": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 0.25 },
+      "claude-fable-5":    { "input": 10.0, "output": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 1.00 },
+      "claude-opus-5-5":   { "input": 4.0,  "output": 20.0, "cache_write_5m": 5.0,   "cache_write_1h": 8.0,  "cache_read": 0.20 },
+      "claude-opus-5":     { "input": 5.0,  "output": 25.0, "cache_write_5m": 6.25,  "cache_write_1h": 10.0, "cache_read": 0.50 },
+      "claude-opus-4":     { "input": 5.0,  "output": 25.0, "cache_write_5m": 6.25,  "cache_write_1h": 10.0, "cache_read": 0.50 },
+      "claude-sonnet-5-5": { "input": 2.0,  "output": 10.0, "cache_write_5m": 2.5,   "cache_write_1h": 4.0,  "cache_read": 0.10 },
+      "claude-sonnet-5":   { "input": 2.0,  "output": 10.0, "cache_write_5m": 2.5,   "cache_write_1h": 4.0,  "cache_read": 0.20 },
+      "claude-sonnet-4":   { "input": 3.0,  "output": 15.0, "cache_write_5m": 3.75,  "cache_write_1h": 6.0,  "cache_read": 0.30 },
+      "claude-haiku-5-5":  { "input": 0.10, "output": 0.50, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01,
+                             "long_context": { "threshold": 100000, "input": 0.50, "output": 2.50, "cache_write_5m": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05 } },
+      "claude-haiku-4-5":  { "input": 1.0,  "output": 5.0,  "cache_write_5m": 1.25,  "cache_write_1h": 2.0,  "cache_read": 0.10 }
+    },
+    "_fallback": "Se l'id del modello non corrisponde a nessuna chiave, si usa il prezzo della famiglia.",
+    "fallback": { "fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5" }
+  }
+}

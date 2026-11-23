@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""factory/bin/route — sceglie reviewer e modelli. Non scrive nulla.
+
+  python3 factory/bin/route JOB                         # routing del job (rischio e superfici dell'intake)
+  python3 factory/bin/route --risk high --surfaces ui   # anteprima
+  python3 factory/bin/route --check                     # valida config.json e mostra la tabella effettiva
+
+Regola: il modello esplicito in config.json (agents.<ruolo>.model) vince sempre;
+se è null vale la tabella `routing`. Se due regole scelgono lo stesso reviewer
+con modelli diversi, vince il più capace (haiku < sonnet < opus < fable).
+La transizione intake -> route -> spec la registra factory/bin/job usando
+la stessa funzione (factorylib.compute_routing).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import factorylib as fl  # noqa: E402
+
+
+def print_table(cfg: dict) -> None:
+    print("Modelli per ruolo (config > default):")
+    for role in fl.DEFAULT_AGENTS:
+        spec = cfg["agents"].get(role) or {}
+        explicit = spec.get("model")
+        if role in fl.REVIEW_ROLES:
+            eff = explicit or "da tabella routing"
+        else:
+            eff = fl.agent_model(cfg, role)
+        src = "config" if explicit else "default"
+        print(f"  {role:<16} {spec.get('agent', ''):<28} {eff:<20} ({src})")
+    print("\nRouting per rischio:")
+    for risk, roles in cfg["routing"]["risk"].items():
+        print(f"  {risk:<8} " + ", ".join(f"{r}={m}" for r, m in roles.items()))
+    print("Routing per superficie:")
+    for surface, roles in (cfg["routing"].get("surfaces") or {}).items():
+        print(f"  +{surface:<7} " + ", ".join(f"{r}={m}" for r, m in roles.items()))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="route", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("job", nargs="?")
+    p.add_argument("--risk")
+    p.add_argument("--surfaces", default="")
+    p.add_argument("--check", action="store_true")
+    args = p.parse_args()
+    try:
+        cfg = fl.load_config()
+        problems = fl.validate_config(cfg)
+        if args.check:
+            print_table(cfg)
+            if problems:
+                print("\nProblemi:\n- " + "\n- ".join(problems))
+                return 1
+            print("\nconfig.json valido.")
+            return 0
+        if problems:
+            raise fl.FactoryError("config.json non valido:\n- " + "\n- ".join(problems))
+        if args.job:
+            job = fl.load_job(fl.resolve_job_id(args.job))
+            if not job.get("risk"):
+                raise fl.FactoryError(f"il job {job['id']} non ha ancora un rischio (stadio {job['stage']})")
+            risk, surfaces = job["risk"], job.get("surfaces", [])
+        elif args.risk:
+            risk, surfaces = args.risk.lower(), fl.as_list(args.surfaces)
+        else:
+            p.error("indica un JOB, oppure --risk, oppure --check")
+        routing = fl.compute_routing(cfg, risk, surfaces)
+        unknown = [s for s in surfaces if s not in fl.known_surfaces(cfg)]
+        print(json.dumps({"risk": risk, "surfaces": surfaces, "ignored_surfaces": unknown, "reviewers": routing},
+                         ensure_ascii=False, indent=1))
+        return 0
+    except fl.FactoryError as exc:
+        print(f"ERRORE: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
