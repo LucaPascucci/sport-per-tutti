@@ -1,0 +1,19 @@
+@if (items().length > 0) {
+  <ul
+    class="divide-y divide-gray-200 rounded-lg border border-gray-200 bg-white"
+    [attr.aria-label]="ariaLabel()"
+  >
+    @for (item of items(); track item.id) {
+      <li class="px-4 py-3">
+        <p class="font-medium text-gray-900">{{ item.title }}</p>
+        @if (item.subtitle) {
+          <p class="text-sm text-gray-600">{{ item.subtitle }}</p>
+        }
+      </li>
+    }
+  </ul>
+} @else {
+  <p class="rounded-lg border border-dashed border-gray-300 p-4 text-center text-gray-600">
+    {{ emptyMessage() }}
+  </p>
+}
