@@ -60,6 +60,16 @@ describe('ItemList', () => {
     expect(element.querySelector('ul')?.getAttribute('aria-label')).toBe('Elenco utenti');
   });
 
+  it('consente di spezzare titoli e sottotitoli lunghi senza spazi', async () => {
+    // jsdom non calcola il layout: il test protegge solo la presenza della classe.
+    const longMail = `${'a'.repeat(60)}@${'b'.repeat(40)}.example.com`;
+    await render({ items: [{ id: 1, title: 'X'.repeat(80), subtitle: longMail }] });
+
+    const item = element.querySelector('ul > li');
+    expect(item?.classList.contains('wrap-anywhere')).toBe(true);
+    expect(item?.textContent).toContain(longMail);
+  });
+
   it('non mette aria-label se non configurato', async () => {
     await render({ items: [{ id: 1, title: 'A' }] });
 

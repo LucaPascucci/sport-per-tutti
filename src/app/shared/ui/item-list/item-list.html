@@ -4,7 +4,7 @@
     [attr.aria-label]="ariaLabel()"
   >
     @for (item of items(); track item.id) {
-      <li class="px-4 py-3">
+      <li class="px-4 py-3 wrap-anywhere">
         <p class="font-medium text-gray-900">{{ item.title }}</p>
         @if (item.subtitle) {
           <p class="text-sm text-gray-600">{{ item.subtitle }}</p>
