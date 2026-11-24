@@ -1,0 +1,15 @@
+<section class="mx-auto max-w-3xl p-4">
+  <h1 class="mb-4 text-2xl font-semibold text-gray-900">Utenti</h1>
+
+  @switch (status()) {
+    @case ('loading') {
+      <p role="status" class="text-gray-600">Caricamento in corso...</p>
+    }
+    @case ('ready') {
+      <app-item-list [items]="items()" ariaLabel="Elenco utenti" />
+    }
+    @case ('error') {
+      <app-notification-banner variant="error" message="Errore durante il recupero dei dati" />
+    }
+  }
+</section>
