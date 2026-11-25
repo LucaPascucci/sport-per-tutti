@@ -10,7 +10,7 @@
 
   "_agents": "Modello esplicito per ogni agente: haiku | sonnet | opus | fable. null = tabella di routing (reviewer) o default (intake fable, gli altri opus). Il valore esplicito vince sempre sulla tabella.",
   "agents": {
-    "intake":          { "agent": "factory-intake",            "model": "fable" },
+    "intake":          { "agent": "factory-intake",            "model": "opus" },
     "spec-writer":     { "agent": "factory-spec-writer",       "model": "opus" },
     "builder":         { "agent": "factory-builder",           "model": "opus" },
     "code-review":     { "agent": "factory-code-reviewer",     "model": null },
