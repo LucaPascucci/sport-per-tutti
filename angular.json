@@ -48,6 +48,14 @@
               "optimization": false,
               "extractLicenses": false,
               "sourceMap": true
+            },
+            "firebase": {
+              "fileReplacements": [
+                {
+                  "replace": "src/app/core/firebase/firebase-options.ts",
+                  "with": "src/app/core/firebase/firebase-options.local.ts"
+                }
+              ]
             }
           },
           "defaultConfiguration": "production"
@@ -60,6 +68,9 @@
             },
             "development": {
               "buildTarget": "sport-per-tutti:build:development"
+            },
+            "firebase": {
+              "buildTarget": "sport-per-tutti:build:development,firebase"
             }
           },
           "defaultConfiguration": "development"

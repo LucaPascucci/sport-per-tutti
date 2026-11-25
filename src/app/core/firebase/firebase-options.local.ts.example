@@ -1,0 +1,17 @@
+// Configurazione Firebase locale per lo sviluppo. Copia questo file con
+//   cp src/app/core/firebase/firebase-options.local.ts.example src/app/core/firebase/firebase-options.local.ts
+// compila i valori presi dalla console Firebase e avvia con `npm run start:firebase`.
+// firebase-options.local.ts è ignorato da git: non va mai versionato.
+import type { FirebaseConfig } from './firebase-config';
+
+export const firebaseConfig: FirebaseConfig = {
+  options: {
+    apiKey: '',
+    authDomain: '',
+    projectId: '',
+    storageBucket: '',
+    messagingSenderId: '',
+    appId: '',
+  },
+  firestoreDatabaseId: '',
+};
