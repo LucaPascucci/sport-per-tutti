@@ -47,6 +47,7 @@ __screenshots__/
 Thumbs.db
 
 # Software factory
+factory/bin/__pycache__/
 factory/jobs/
 factory/inbox/processed/
 factory/**/*.new
