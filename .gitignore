@@ -39,6 +39,9 @@ testem.log
 /typings
 __screenshots__/
 
+# Firebase config locale/generata (mai versionare)
+/src/app/core/firebase/firebase-options.local.ts
+
 # System files
 .DS_Store
 Thumbs.db

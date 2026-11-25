@@ -11,17 +11,3 @@ export interface FirebaseConfig {
  * Questo file importa da Firebase solo tipi, per tenere l'SDK fuori dal bundle iniziale.
  */
 export const FIREBASE_CONFIG = new InjectionToken<FirebaseConfig>('FIREBASE_CONFIG');
-
-// Configurazione web di Firebase: identificativi pubblici, non segreti.
-// La protezione dei dati dipende dalle Firestore Security Rules.
-export const firebaseConfig: FirebaseConfig = {
-  options: {
-    apiKey: '',
-    authDomain: '',
-    projectId: '',
-    storageBucket: '',
-    messagingSenderId: '',
-    appId: '',
-  },
-  firestoreDatabaseId: '',
-};
